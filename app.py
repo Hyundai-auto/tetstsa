@@ -2,7 +2,6 @@ import os
 import asyncio
 import json
 import re
-# import httpx
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from playwright.async_api import async_playwright
@@ -26,20 +25,26 @@ async def generate_pix_logic(data):
     cpf_clean = ''.join(c for c in payer_cpf if c.isdigit())
     phone_clean = ''.join(c for c in payer_phone if c.isdigit())
 
-    # TENTATIVA 1: Via Playwright (mais robusto contra Cloudflare)
-    # Mas com otimização extrema de tempo
     async with async_playwright() as p:
         try:
+            # OTIMIZAÇÃO: Modo ultra-leve para não estourar a memória do Render
             browser = await p.chromium.launch(
                 headless=True,
-                args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+                args=[
+                    '--no-sandbox', 
+                    '--disable-setuid-sandbox', 
+                    '--disable-dev-shm-usage',
+                    '--disable-gpu',
+                    '--no-zygote',
+                    '--single-process'
+                ]
             )
             context = await browser.new_context(
                 user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
             )
             page = await context.new_page()
             
-            # Bloquear tudo que não é script de pagamento
+            # Bloqueio total de recursos pesados
             await page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "font", "media", "stylesheet"] else route.continue_())
             
             pix_url = None
@@ -58,9 +63,10 @@ async def generate_pix_logic(data):
 
             page.on('response', handle_response)
 
-            # Navegar e injetar
-            await page.goto(EXTERNAL_CHECKOUT_URL, wait_until='domcontentloaded', timeout=15000)
+            # Navegação rápida
+            await page.goto(EXTERNAL_CHECKOUT_URL, wait_until='domcontentloaded', timeout=20000)
             
+            # Injeção de dados via JS
             await page.evaluate("""(d) => {
                 const i = setInterval(() => {
                     if (window.form && typeof realizarPagamento === 'function') {
@@ -78,8 +84,8 @@ async def generate_pix_logic(data):
                 }, 100);
             }""", {'email': payer_email, 'name': payer_name, 'cpf': cpf_clean, 'phone': phone_clean})
 
-            # Esperar resposta rápida
-            for _ in range(40):
+            # Esperar resposta
+            for _ in range(60): # Aumentado para 12 segundos de polling
                 if pix_url or error_msg: break
                 if 'obrigado' in page.url:
                     pix_url = page.url
@@ -95,14 +101,14 @@ async def generate_pix_logic(data):
 def proxy_pix():
     data = request.get_json()
     try:
-        # Usar um timeout global para evitar que o Render mate o processo
+        # Usar asyncio.run de forma limpa
         pix_url, error = asyncio.run(generate_pix_logic(data))
         if pix_url:
             return jsonify({'success': True, 'pixUrl': pix_url})
         else:
-            return jsonify({'success': False, 'error': error or 'Timeout ou erro no checkout externo'})
+            return jsonify({'success': False, 'error': error or 'O checkout externo demorou a responder. Tente novamente.'})
     except Exception as e:
-        return jsonify({'success': False, 'error': 'Erro interno: ' + str(e)}), 500
+        return jsonify({'success': False, 'error': 'Erro no servidor: ' + str(e)}), 500
 
 @app.route('/')
 def index():
