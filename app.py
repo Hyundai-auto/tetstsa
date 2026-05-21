@@ -2,6 +2,7 @@ import os
 import time
 import json
 import re
+import sys
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from playwright.sync_api import sync_playwright
@@ -11,6 +12,9 @@ CORS(app)
 
 EXTERNAL_CHECKOUT_URL = "https://pay.meuservicomei.com.br/r/a51L1PhTl58c6S86"
 EXTERNAL_BASE_URL = "https://pay.meuservicomei.com.br"
+
+def log_debug(msg):
+    print(f"[DEBUG] {msg}", file=sys.stderr)
 
 def generate_pix_logic(data):
     payer_name = data.get('payer_name', '')
@@ -25,8 +29,11 @@ def generate_pix_logic(data):
     cpf_clean = ''.join(c for c in payer_cpf if c.isdigit())
     phone_clean = ''.join(c for c in payer_phone if c.isdigit())
 
+    log_debug(f"Iniciando processo para: {payer_name} | CPF: {cpf_clean}")
+
     with sync_playwright() as p:
         try:
+            log_debug("Lançando navegador Chromium...")
             browser = p.chromium.launch(
                 headless=True,
                 args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
@@ -47,18 +54,21 @@ def generate_pix_logic(data):
                 if '/orders' in response.url:
                     try:
                         res_data = response.json()
+                        log_debug(f"Resposta da API /orders recebida: {res_data}")
                         if 'redirect' in res_data:
-                            pix_url = res_data['redirect'] if res_data['redirect'].startswith('http') else f"{EXTERNAL_BASE_URL}/{res_data['redirect'].lstrip('/')}"
+                            redirect = res_data['redirect']
+                            pix_url = redirect if redirect.startswith('http') else f"{EXTERNAL_BASE_URL}/{redirect.lstrip('/')}"
                         elif 'errors' in res_data:
                             error_msg = str(res_data['errors'])
-                    except: pass
+                    except Exception as e:
+                        log_debug(f"Erro ao processar JSON da resposta: {e}")
 
             page.on('response', handle_response)
 
-            print(f"Iniciando geração de PIX para: {payer_name}")
+            log_debug(f"Navegando para: {EXTERNAL_CHECKOUT_URL}")
             page.goto(EXTERNAL_CHECKOUT_URL, wait_until='domcontentloaded', timeout=30000)
             
-            # Injeção de dados via JS
+            log_debug("Injetando dados no formulário via JavaScript...")
             page.evaluate("""(d) => {
                 const i = setInterval(() => {
                     if (window.form && typeof realizarPagamento === 'function') {
@@ -76,18 +86,25 @@ def generate_pix_logic(data):
                 }, 100);
             }""", {'email': payer_email, 'name': payer_name, 'cpf': cpf_clean, 'phone': phone_clean})
 
-            # Polling de resposta (máximo 20 segundos)
+            log_debug("Aguardando geração do PIX (polling)...")
             start_time = time.time()
-            while time.time() - start_time < 20:
-                if pix_url or error_msg: break
+            while time.time() - start_time < 25:
+                if pix_url:
+                    log_debug(f"Sucesso! PIX gerado: {pix_url}")
+                    break
+                if error_msg:
+                    log_debug(f"Erro retornado pelo checkout: {error_msg}")
+                    break
                 if 'obrigado' in page.url:
                     pix_url = page.url
+                    log_debug(f"Redirecionamento detectado pela URL: {pix_url}")
                     break
                 time.sleep(0.5)
             
             browser.close()
             return pix_url, error_msg
         except Exception as e:
+            log_debug(f"Exceção durante a automação: {e}")
             return None, str(e)
 
 @app.route('/proxy/pix', methods=['POST'])
@@ -98,10 +115,10 @@ def proxy_pix():
         if pix_url:
             return jsonify({'success': True, 'pixUrl': pix_url})
         else:
-            return jsonify({'success': False, 'error': error or 'O checkout externo demorou a responder.'})
+            return jsonify({'success': False, 'error': error or 'O checkout externo demorou muito para responder. Tente novamente.'})
     except Exception as e:
-        print(f"Erro Interno: {e}")
-        return jsonify({'success': False, 'error': 'Erro interno no servidor.'}), 500
+        log_debug(f"Erro Crítico no Servidor: {e}")
+        return jsonify({'success': False, 'error': 'Erro interno no servidor. Verifique os logs.'}), 500
 
 @app.route('/')
 def index():
