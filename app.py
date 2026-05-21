@@ -2,6 +2,7 @@ import os
 import asyncio
 import json
 import re
+import threading
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from playwright.async_api import async_playwright
@@ -18,24 +19,30 @@ class FastBrowser:
         self.browser = None
         self.ready_page = None
         self.lock = asyncio.Lock()
+        self.initialized = False
 
     async def start(self):
-        if not self.browser:
-            self.playwright = await async_playwright().start()
-            self.browser = await self.playwright.chromium.launch(
-                headless=True,
-                args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
-            )
-            await self.prepare_next_page()
+        async with self.lock:
+            if not self.initialized:
+                self.playwright = await async_playwright().start()
+                self.browser = await self.playwright.chromium.launch(
+                    headless=True,
+                    args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+                )
+                self.initialized = True
+                # Pre-carrega a primeira página
+                asyncio.create_task(self.prepare_next_page())
 
     async def prepare_next_page(self):
         """Pre-carrega uma aba do checkout em background"""
+        if not self.browser:
+            return
+            
         context = await self.browser.new_context(
             user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
         )
         page = await context.new_page()
         
-        # Bloqueio de recursos para carregar mais rápido
         async def block(route):
             if route.request.resource_type in ["image", "font", "media", "stylesheet"]:
                 return await route.abort()
@@ -45,7 +52,6 @@ class FastBrowser:
         
         try:
             await page.goto(EXTERNAL_CHECKOUT_URL, wait_until='domcontentloaded', timeout=20000)
-            # Aguardar o form estar pronto
             await page.wait_for_function("() => window.form !== undefined", timeout=10000)
             self.ready_page = page
             print("Aba de checkout pré-carregada e pronta.")
@@ -54,6 +60,15 @@ class FastBrowser:
             await context.close()
 
     async def get_ready_page(self):
+        if not self.initialized:
+            await self.start()
+            
+        # Esperar até 5 segundos por uma página pronta
+        for _ in range(25):
+            if self.ready_page:
+                break
+            await asyncio.sleep(0.2)
+            
         async with self.lock:
             page = self.ready_page
             self.ready_page = None
@@ -62,13 +77,6 @@ class FastBrowser:
             return page
 
 fast_browser = FastBrowser()
-
-@app.before_first_request
-def startup():
-    # Inicia o browser no primeiro request
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(fast_browser.start())
 
 async def generate_pix_instant(payer_name, payer_cpf, payer_phone, payer_email=None):
     if not payer_email:
@@ -80,9 +88,7 @@ async def generate_pix_instant(payer_name, payer_cpf, payer_phone, payer_email=N
     
     page = await fast_browser.get_ready_page()
     if not page:
-        # Fallback se não houver página pronta
-        await fast_browser.start()
-        page = await fast_browser.get_ready_page()
+        return None, "Servidor ocupado ou falha ao carregar checkout externo."
 
     pix_url = None
     error_msg = None
@@ -104,7 +110,6 @@ async def generate_pix_instant(payer_name, payer_cpf, payer_phone, payer_email=N
     page.on('response', handle_response)
 
     try:
-        # Injeção instantânea (a página já está aberta!)
         await page.evaluate("""(data) => {
             window.form.email = data.email;
             window.form.first_name = data.name;
@@ -127,7 +132,6 @@ async def generate_pix_instant(payer_name, payer_cpf, payer_phone, payer_email=N
             }
         }""", {'email': payer_email, 'name': payer_name, 'cpf': cpf_clean, 'phone': phone_clean})
 
-        # Aguardar resposta
         for _ in range(40):
             if pix_url or error_msg: break
             if 'obrigado' in page.url:
@@ -136,7 +140,6 @@ async def generate_pix_instant(payer_name, payer_cpf, payer_phone, payer_email=N
             await asyncio.sleep(0.2)
             
     finally:
-        # Fecha o contexto da aba usada
         await page.context.close()
 
     return pix_url, error_msg
@@ -144,6 +147,8 @@ async def generate_pix_instant(payer_name, payer_cpf, payer_phone, payer_email=N
 @app.route('/proxy/pix', methods=['POST'])
 def proxy_pix():
     data = request.get_json()
+    
+    # Garantir que o browser está iniciado
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
