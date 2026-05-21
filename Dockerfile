@@ -1,0 +1,22 @@
+# Use a imagem oficial do Python com Playwright pré-instalado ou baseada em Debian
+FROM mcr.microsoft.com/playwright/python:v1.43.0-jammy
+
+# Definir diretório de trabalho
+WORKDIR /app
+
+# Copiar arquivos de requisitos e instalar dependências
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copiar o restante do código
+COPY . .
+
+# O Playwright já vem com os navegadores na imagem da Microsoft, 
+# mas garantimos que o Chromium está pronto
+RUN playwright install chromium
+
+# Expor a porta que o Flask usa
+EXPOSE 5000
+
+# Comando para iniciar a aplicação
+CMD ["python", "app.py"]
