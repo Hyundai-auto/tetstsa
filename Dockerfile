@@ -1,4 +1,4 @@
-# Use a imagem oficial do Playwright que já vem com tudo configurado
+# Use a imagem oficial do Playwright
 FROM mcr.microsoft.com/playwright/python:v1.43.0-jammy
 
 # Definir diretório de trabalho
@@ -15,7 +15,7 @@ RUN playwright install chromium
 COPY . .
 
 # Expor a porta
-EXPOSE 5000
+EXPOSE 10000
 
-# Comando para iniciar a aplicação
-CMD ["python", "app.py"]
+# Comando para iniciar com Gunicorn e timeout estendido
+CMD ["gunicorn", "--bind", "0.0.0.0:10000", "--timeout", "120", "--workers", "1", "app:app"]
